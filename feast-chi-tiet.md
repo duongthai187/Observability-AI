@@ -206,7 +206,141 @@ model.predict(feature_vector)
 
 ---
 
-## 6. Vector search trong Feast
+## 6. Point-in-time correct joins — Chống data leakage chi tiết
+
+> Đây là **tính năng quan trọng nhất** của Feast giúp tránh data leakage.
+> Nguồn: [Feast Docs — Point-in-time joins](https://docs.feast.dev/getting-started/concepts/point-in-time-joins)
+
+### 6.1 Vấn đề: Data leakage là gì?
+
+**Data leakage** xảy ra khi dữ liệu từ **tương lai** (future data) bị lọt vào quá trình training. Khi đó model học được những thông tin mà nó **không thể có** tại thời điểm dự đoán thực tế, dẫn đến:
+
+- ✅ Accuracy trên validation/test rất cao
+- ❌ Khi deploy → performance thực tế rất tệ (vì model đã "gian lận")
+
+**Ví dụ cụ thể:**
+
+| event_timestamp | driver_id | conv_rate (thực tế) | conv_rate (bị leak) |
+|---|---|---|---|
+| 2024-06-01 08:00 | 1001 | 0.45 | 0.45 ✅ |
+| 2024-06-01 10:00 | 1001 | 0.52 | 0.52 ✅ |
+| 2024-06-01 12:00 | 1001 | 0.38 | **0.61** ❌ ← giá trị từ 2024-06-02 |
+
+Giá trị `0.61` là conv_rate của ngày hôm sau (2024-06-02) nhưng bị join nhầm vào dòng training của ngày 2024-06-01 → data leakage.
+
+### 6.2 Cách Feast giải quyết: Point-in-time join
+
+Feast dùng **event timestamp** làm mốc chặn trên (upper bound) khi join features:
+
+```
+ entity_df                              feature data
+┌──────────────────────┐             ┌──────────────────────────────┐
+│ driver_id │ timestamp │             │ driver_id │ timestamp │ value│
+├──────────────────────┤             ├──────────────────────────────┤
+│   1001    │ 2024-06-01│──┐         │   1001    │ 2024-06-01 │ 0.45 │◄── lấy
+│   1001    │ 2024-06-02│──┤         │   1001    │ 2024-06-02 │ 0.61 │◄── lấy
+│   1001    │ 2024-06-03│──┤         │   1001    │ 2024-06-03 │ 0.55 │
+└──────────────────────┘  │         │   1001    │ 2024-06-04 │ 0.70 │── không lấy
+                          │         └──────────────────────────────┘
+                          │                    ▲
+                          └────────────────────┘
+                    Feast chỉ lấy feature có
+                    event_timestamp <= entity timestamp
+```
+
+**Cơ chế hoạt động:**
+
+1. Với mỗi dòng trong `entity_df` (dữ liệu training), Feast nhìn vào cột `event_timestamp`.
+2. Feast truy vấn `offline store` và chỉ lấy bản ghi feature có `event_timestamp <= entity_timestamp`.
+3. Feast lấy bản ghi **gần nhất** (latest value) trước hoặc bằng mốc thời gian đó.
+4. Kết quả: **không có giá trị "tương lai" nào lọt vào training set.**
+
+### 6.3 Code minh họa
+
+```python
+from feast import FeatureStore
+import pandas as pd
+from datetime import datetime
+
+store = FeatureStore(repo_path=".")
+
+# entity_df chứa cột event_timestamp — mốc thời gian của từng sự kiện
+entity_df = pd.DataFrame({
+    "driver_id": [1001, 1001, 1001],
+    "event_timestamp": [
+        datetime(2024, 6, 1, 8, 0),   # sáng 1/6
+        datetime(2024, 6, 1, 10, 0),  # trưa 1/6
+        datetime(2024, 6, 1, 12, 0),  # chiều 1/6
+    ],
+})
+
+# Feast tự động point-in-time join — không leak!
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_hourly_stats:conv_rate"],
+).to_df()
+```
+
+### 6.4 Lọc thêm bằng `created_timestamp` — Chống backfill leakage
+
+Ngoài `event_timestamp`, Feast còn hỗ trợ thêm một lớp bảo vệ: **`filter_by_created_timestamp`**.
+
+Vấn đề: Dữ liệu có thể bị **backfill** (sửa/cập nhật sau). Ví dụ:
+
+```
+┌──────────┬──────────────┬──────────────┬──────────────┐
+│ driver_id│ event_timestamp │ value │ created_timestamp │
+├──────────┼──────────────┼──────────────┼──────────────┤
+│   1001   │ 2024-06-01   │   0.45       │ 2024-06-01   │ ← ghi đúng hôm đó
+│   1001   │ 2024-06-01   │   0.55       │ 2024-06-03   │ ← backfill sau 2 ngày!
+└──────────┴──────────────┴──────────────┴──────────────┘
+```
+
+Nếu không có `filter_by_created_timestamp`, Feast vẫn lấy giá trị `0.55` (dù nó được ghi sau). Nếu bật flag:
+
+```python
+training_df = store.get_historical_features(
+    entity_df=entity_df,
+    features=["driver_hourly_stats:conv_rate"],
+    filter_by_created_timestamp=True,  # ← chỉ lấy feature có created_timestamp <= event_timestamp
+).to_df()
+```
+
+Kết quả: Feast chỉ lấy `0.45` vì `created_timestamp (2024-06-01) <= event_timestamp (2024-06-01)`.
+
+> **Lưu ý:** Tính năng này yêu cầu feature view có cột `created_timestamp_column` được định nghĩa, và offline store phải hỗ trợ.
+
+### 6.5 Tại sao point-in-time join quan trọng với Observability-AI?
+
+Trong hệ thống observability/monitoring, dữ liệu thường đến **không đều** (irregular intervals):
+
+```
+03:00 — CPU 45%
+03:05 — CPU 52%
+03:12 — CPU 48%   ← bạn muốn predict tại mốc này
+03:20 — CPU 61%
+```
+
+Khi join với các feature sources khác (số lượng request, memory usage, disk I/O...), nếu không có point-in-time join:
+
+- Feature của **03:20** có thể bị lấy nhầm cho dự đoán ở **03:12** → model học sai.
+- Feature của **03:12** là "tương lai" của feature source khác đến trễ → training sai.
+
+Feast đảm bảo mỗi mẫu training chỉ nhìn thấy dữ liệu **tại đúng thời điểm nó xảy ra** — giống hệt những gì model sẽ thấy khi inference thực tế.
+
+### 6.6 Tóm tắt
+
+| Khái niệm | Vai trò chống leakage |
+|---|---|
+| `event_timestamp` | Upper bound — chỉ lấy feature có timestamp ≤ entity timestamp |
+| Point-in-time join | Với mỗi entity row, lấy **latest value** trước mốc đó |
+| `filter_by_created_timestamp` | Loại bỏ feature bị **backfill** sau thời điểm event |
+| `get_historical_features` | Tự động thực hiện point-in-time join |
+| Consistency | Cùng một FeatureService cho cả training và serving |
+
+---
+
+## 7. Vector search trong Feast
 
 Feast hỗ trợ **vector search** qua các online store vector: **Qdrant, Milvus, Faiss**, và Elasticsearch.
 
@@ -245,7 +379,7 @@ docs = store.retrieve_online_documents_v2(
 
 ---
 
-## 7. Feast hoạt động tốt khi nào?
+## 8. Feast hoạt động tốt khi nào?
 
 | Nên dùng Feast | Không cần Feast |
 |---|---|
@@ -256,9 +390,11 @@ docs = store.retrieve_online_documents_v2(
 
 ---
 
-## 8. Tham khảo
+## 9. Tham khảo
 
 - Docs: https://docs.feast.dev/
+- Point-in-time joins: https://docs.feast.dev/getting-started/concepts/point-in-time-joins
+- Data integrity: https://docs.feast.dev/reference/data-integrity
 - Vector DB integration: https://docs.feast.dev/reference/online-stores/milvus
 - RAG example: https://github.com/feast-dev/feast/tree/master/examples/rag
 - GitHub: https://github.com/feast-dev/feast

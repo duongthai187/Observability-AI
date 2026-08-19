@@ -8,19 +8,52 @@
 
 ## 1. Tổng quan kiến trúc
 
-```mermaid
-flowchart LR
-    U[Client / Swagger] -->|POST /v1/retrieve/| API[FastAPI :8055]
-    API --> RAG[RagService]
-    RAG --> GEN[GeneratorService]
-    GEN -->|qwen3.7-flash via AI Box| LLM[(OpenAI-compatible API)]
-    GEN --> TOOL["Tool: search_embeddings"]
-    TOOL --> RET[RetrievalService]
-    RET --> EMB["Encode query · all-MiniLM-L6-v2"]
-    EMB --> QD[(Qdrant :6333)]
-    LF[Langfuse :3000] -. trace / prompt / score .-> RAG & GEN & RET
-    LF --> EVAL["LLM-as-a-Judge · toxicity (qwen3.7-flash)"]
-    QD --> RET
+```
+┌──────────────┐     POST /v1/retrieve/     ┌────────────────┐
+│  Client /    │ ──────────────────────────▶│  FastAPI :8055 │
+│  Swagger     │                            └───────┬────────┘
+└──────────────┘                                    │
+                                                     ▼
+                                            ┌────────────────┐
+                                            │  RagService    │
+                                            └───────┬────────┘
+                                                     │
+                                                     ▼
+                                            ┌────────────────┐
+                                            │GeneratorService│
+                                            └───────┬────────┘
+                                                     │
+                          ┌──────────────────────────┼──────────────────────┐
+                          │                          │                      │
+                          ▼                          ▼                      ▼
+              ┌──────────────────────┐   ┌────────────────────┐   ┌────────────────┐
+              │  OpenAI-compatible   │   │ Tool: search_emb   │   │   Langfuse     │
+              │  API (AI Box)        │   │ ddings             │   │   :3000        │
+              │  qwen3.7-flash       │   └─────────┬──────────┘   └───────┬────────┘
+              └──────────────────────┘             │                      │
+                                                   ▼                      │
+                                        ┌────────────────────┐           │
+                                        │  RetrievalService  │◀── trace ─┘
+                                        └─────────┬──────────┘  prompt
+                                                   │              score
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ Encode query       │
+                                        │ all-MiniLM-L6-v2   │
+                                        └─────────┬──────────┘
+                                                   │
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │  Qdrant :6333      │
+                                        │  (vector DB)       │
+                                        └────────────────────┘
+                                                   │
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ LLM-as-a-Judge     │
+                                        │ toxicity           │
+                                        │ (qwen3.7-flash)    │
+                                        └────────────────────┘
 ```
 
 | Thành phần | Vai trò |
