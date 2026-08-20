@@ -55,48 +55,116 @@
 
 ## 3. Core concepts
 
-### 3.1 Entity
+### 3.1 Entity — "Khoá chính" để nối features
 
-**Entity** là "khóa" dùng để nối features — ví dụ `driver_id`, `user_id`. Mỗi feature gắn với một entity.
+**Entity** là định danh cho một đối tượng trong thế giới thực — `driver_id`, `user_id`, `sensor_id`...
+Nó giống **primary key** trong database: dùng để nối features từ nhiều FeatureView khác nhau.
 
 ```python
 from feast import Entity
 
+# Entity: driver (join key = driver_id)
 driver = Entity(
     name="driver",
-    join_keys=["driver_id"],
+    join_keys=["driver_id"],       # tên cột dùng để JOIN
+    description="A driver in the fleet",
+    value_type=ValueType.INT64,    # kiểu dữ liệu của join key
 )
 ```
 
-### 3.2 FeatureView
+> **Ví dụ trực quan:** Entity giống bảng `drivers(id, name, phone)` trong SQL.
+> Các bảng feature khác (`driver_trips`, `driver_ratings`) đều có cột `driver_id` → JOIN qua đó.
 
-**FeatureView** là một nhóm features logic, kết nối với một data source, có TTL, và gắn với entity.
+### 3.2 FeatureView — "Bảng ảo" chứa features
+
+**FeatureView** là một nhóm features có liên quan, gắn với một data source, có TTL, và thuộc về một entity.
 
 ```python
-from feast import FeatureView, Field
+from feast import FeatureView, Field, FileSource
 from feast.types import Float32, Int32
 from datetime import timedelta
 
+# Nguồn dữ liệu (offline store)
+driver_stats_source = FileSource(
+    path="data/driver_stats.parquet",
+    timestamp_field="event_timestamp",
+)
+
+# FeatureView — giống như 1 VIEW trong SQL
 driver_hourly_stats = FeatureView(
     name="driver_hourly_stats",
-    entities=["driver"],
-    ttl=timedelta(days=1),       # giữ data trong bao lâu
+    entities=["driver"],                # belongs to entity "driver"
+    ttl=timedelta(days=1),              # dữ liệu cũ hơn 1 ngày bỏ qua
     schema=[
         Field(name="conv_rate", dtype=Float32),
         Field(name="acc_rate", dtype=Float32),
         Field(name="avg_daily_trips", dtype=Int32),
     ],
     source=driver_stats_source,
+    online=True,                        # ← đưa lên online store để serve
 )
 ```
 
-**Khái niệm quan trọng** — FeatureView có flag:
-- `online=True`: feature được đưa vào online store để serve.
-- `offline=True`: feature chỉ dùng cho training.
+**Tham số `online` và `offline`** — mặc định:
 
-### 3.3 FeatureService
+```python
+online:  True   # FeatureView có sẵn trong online store → get_online_features()
+offline: False  # FeatureView KHÔNG có sẵn trong offline store → get_historical_features()
+```
 
-**FeatureService** gom một nhóm features lại, dùng chung cho cả training và serving — đảm bảo bạn luôn query đúng cùng một bộ features.
+Ý nghĩa:
+
+| Flag | `True` | `False` |
+|---|---|---|
+| `online=True` | Feature được **materialize vào online store** (Milvus, Redis...) → `get_online_features()` hoạt động | Feature **không có trong online store** → `get_online_features()` lỗi |
+| `offline=True` | Feature có thể được dùng để **train model** qua `get_historical_features()` | Feature **không dùng được cho training** |
+
+**Ràng buộc:**
+- `online=True` → bắt buộc phải có `source` (data source) và `entities` (trừ feature view không entity)
+- `online=True` → dữ liệu phải có **event timestamp** (Feast cần để xác định giá trị mới nhất)
+- `online=True` mà không `materialize` hoặc `write_to_online_store` → online store rỗng → `get_online_features()` trả về rỗng
+- Có thể bật cả `online=True` và `offline=True` — feature vừa serve được vừa train được
+
+> Nguồn: [Feast docs — Feature view](https://docs.feast.dev/getting-started/concepts/feature-view.md) | Source code: `FeatureView.__init__(online=True, offline=False)`
+
+### 3.3 FeatureService — "Gói features" cho một model
+
+**FeatureService** gom FeatureView lại thành 1 nhóm, dùng chung cho cả training và serving.
+Đảm bảo **cùng một bộ features** được dùng ở cả 2 phase.
+
+```python
+from feast import FeatureService
+
+# Gói features cho model "driver_activity_v1"
+driver_activity_fs = FeatureService(
+    name="driver_activity_v1",
+    features=[
+        driver_hourly_stats,                     # lấy tất cả fields
+        driver_ratings_fv[["lifetime_rating"]],   # chỉ lấy 1 field
+    ],
+)
+```
+
+**Dùng FeatureService giúp:**
+
+```python
+# Training — dùng FeatureService
+training_df = store.get_historical_features(
+    feature_service="driver_activity_v1",   # ← gọi bằng tên
+    entity_df=entity_df,
+).to_df()
+
+# Serving — cũng FeatureService đó
+features = store.get_online_features(
+    feature_service="driver_activity_v1",   # ← y hệt
+    entity_rows=[{"driver_id": 1001}],
+).to_dict()
+```
+
+> **Lợi ích:** Không cần nhớ "features gồm những cột nào" — cứ gọi tên service là đủ.
+> Khi thêm/bớt feature, chỉ sửa 1 chỗ (FeatureService definition), không phải sửa code train + serve riêng.
+>
+> Nguồn: [Feast docs — FeatureService](https://docs.feast.dev/project/adr/adr-0001-feature-services.md)
 
 ```python
 from feast import FeatureService
@@ -107,7 +175,80 @@ driver_ranking_service = FeatureService(
 )
 ```
 
-### 3.4 Data Source
+### 3.4 `online` / `offline` — Materialize vào online store
+
+Tham số `online` và `offline` trong FeatureView quyết định feature có sẵn ở đâu:
+
+| Flag | Mặc định | `True` | `False` |
+|---|---|---|---|
+| `online` | `True` | Feature được materialize vào **online store** → `get_online_features()` hoạt động | Feature **không có trong online store** → serve lỗi |
+| `offline` | `False` | Feature có thể dùng **train model** qua `get_historical_features()` | Feature **không dùng được cho training** |
+
+> Nguồn: [Feast docs — Feature view](https://docs.feast.dev/getting-started/concepts/feature-view.md) | Source code: `FeatureView.__init__(online=True, offline=False)`
+
+**Ràng buộc khi `online=True`:**
+1. Phải có `source` (data source) — Feast cần biết lấy dữ liệu từ đâu
+2. Phải có `entities` (trừ feature view không entity)
+3. Dữ liệu phải có **event timestamp** — Feast cần để xác định giá trị mới nhất
+4. Phải **materialize** hoặc `write_to_online_store` — nếu không online store rỗng
+
+#### Cách đưa dữ liệu vào online store
+
+**Cách 1 — `feast materialize` (stateless):**
+
+```bash
+# Materialize tất cả feature views trong khoảng [start, end]
+feast materialize 2024-01-07T00:00:00 2024-01-08T00:00:00
+
+# Chỉ materialize 1 feature view cụ thể
+feast materialize ... -v driver_hourly_stats
+```
+
+> Nguồn: [Feast docs — Load data into online store](https://docs.feast.dev/how-to-guides/feast-snowflake-gcp-aws/load-data-into-the-online-store)
+
+**Cách 2 — `feast materialize-incremental` (stateful):**
+
+```bash
+# Lần 1: materialize từ đầu → 2024-01-08
+feast materialize-incremental 2024-01-08T00:00:00
+# Registry nhớ: "đã chạy đến 2024-01-08"
+
+# Lần 2: tự động chạy từ 2024-01-08 → 2024-01-10 (chỉ data mới)
+feast materialize-incremental 2024-01-10T00:00:00
+```
+
+> Nguồn: [Feast docs — materialize-incremental](https://docs.feast.dev/reference/feast-cli-commands.md)
+
+**Cách 3 — `store.write_to_online_store(df)` (trực tiếp từ code):**
+
+```python
+store = FeatureStore("feature_repo")
+store.write_to_online_store(
+    feature_view_name="docs_embeddings",
+    df=prepared_dataframe,
+)
+```
+
+#### Cách Feast xử lý nhiều record cùng ID
+
+Khi materialize trong khoảng thời gian, Feast **chỉ lấy giá trị mới nhất** của mỗi entity:
+
+```
+Offline store (parquet)                        Online store (Milvus)
+┌──────────────────────────────────────┐       ┌──────────────────────┐
+│ driver_id │ event_timestamp │ conv_rate│      │ driver_id │ conv_rate│
+├──────────────────────────────────────┤       ├──────────────────────┤
+│ 1001      │ 2024-01-07 08:00 │ 0.45  │       │ 1001      │ 0.72    │ ← latest
+│ 1001      │ 2024-01-07 10:00 │ 0.52  │──materialize──▶│ 1002      │ 0.88    │
+│ 1001      │ 2024-01-07 12:00 │ 0.72  │       └──────────────────────┘
+│ 1002      │ 2024-01-07 09:00 │ 0.88  │
+│ 1002      │ 2024-01-07 11:00 │ 0.91  │
+└──────────────────────────────────────┘
+```
+
+Entity nào không có record trong khoảng thời gian → bị bỏ qua, không ảnh hưởng đến online store.
+
+### 3.5 Data Source
 
 Nguồn dữ liệu cho FeatureView: file parquet, Kafka, PostgreSQL, BigQuery, Snowflake, Redshift, Spark...
 
@@ -248,12 +389,33 @@ Feast dùng **event timestamp** làm mốc chặn trên (upper bound) khi join f
                     event_timestamp <= entity timestamp
 ```
 
+**Tại sao không tự filter bằng code?**
+
+Bạn nói đúng — về mặt lý thuyết viết:
+
+```python
+df_filtered = df_feature[df_feature.event_timestamp <= entity_ts]
+```
+
+cũng cho kết quả tương tự. Nhưng Feast làm thêm nhiều việc mà filter tay dễ sai:
+
+| Việc | Filter tay | Feast |
+|---|---|---|
+| **Lấy latest value** | Phải `groupby + sort + first` | ✅ Tự động |
+| **Nhiều FeatureView** | Phải JOIN nhiều lần, dễ sai | ✅ 1 lệnh `get_historical_features` |
+| **Backfill** | Dữ liệu thêm vào quá khứ → filter tay không biết | ✅ Dùng `created_timestamp` loại bỏ |
+| **Distributed (BigQuery, Spark)** | Phải viết SQL riêng từng nền tảng | ✅ Tự động |
+| **Point-in-time chính xác** | `event_timestamp <= entity_ts` là đúng, nhưng quên `created_timestamp` | ✅ Dùng cả 2 |
+
 **Cơ chế hoạt động:**
 
 1. Với mỗi dòng trong `entity_df` (dữ liệu training), Feast nhìn vào cột `event_timestamp`.
 2. Feast truy vấn `offline store` và chỉ lấy bản ghi feature có `event_timestamp <= entity_timestamp`.
 3. Feast lấy bản ghi **gần nhất** (latest value) trước hoặc bằng mốc thời gian đó.
-4. Kết quả: **không có giá trị "tương lai" nào lọt vào training set.**
+4. Feast kiểm tra `created_timestamp` để loại bỏ backfill (dữ liệu được thêm vào sau).
+5. Kết quả: **không có giá trị "tương lai" nào lọt vào training set.**
+
+> Nguồn: [Feast Docs — Point-in-time joins](https://docs.feast.dev/getting-started/concepts/point-in-time-joins)
 
 ### 6.3 Code minh họa
 
@@ -344,7 +506,131 @@ Feast đảm bảo mỗi mẫu training chỉ nhìn thấy dữ liệu **tại �
 
 Feast hỗ trợ **vector search** qua các online store vector: **Qdrant, Milvus, Faiss**, và Elasticsearch.
 
-### Cấu hình ví dụ (Milvus)
+### 7.1 Provider trong Feast — `local` vs `gcp` vs `aws`
+
+**Provider** quyết định hạ tầng *mặc định* cho offline store, online store, và compute:
+
+| Provider | Offline store mặc định | Online store mặc định | Dùng khi |
+|---|---|---|---|
+| **`local`** | File (parquet) | SQLite | Phát triển local, máy cá nhân |
+| **`gcp`** | Google BigQuery | Google Datastore | Deploy trên Google Cloud |
+| **`aws`** | AWS Redshift | AWS DynamoDB | Deploy trên AWS |
+
+> Nguồn: [Feast docs — Providers](https://docs.feast.dev/getting-started/components/provider.md)
+
+**Quan trọng:** provider chỉ là **mặc định**. Bạn có thể **override** từng thành phần:
+
+```yaml
+provider: local                # mặc định offline=file, online=SQLite
+online_store:
+  type: milvus                 # override online store thành Milvus
+```
+
+Vậy `provider: local` + `online_store: milvus` = "dùng local cho mọi thứ, nhưng online store thì chạy Milvus".
+
+### 7.2 Feast tìm feature repository bằng cách nào?
+
+**Feature repository** là thư mục chứa:
+1. `feature_store.yaml` — cấu hình Feast
+2. Các file `.py` — định nghĩa `FeatureView`, `Entity`, `DataSource`...
+
+> Nguồn: [Feast docs — Feature Repository](https://docs.feast.dev/reference/feature-repository.md)
+
+Feast tìm repository theo cách sau:
+
+```bash
+# Cách 1 — feast apply trong thư mục hiện tại
+cd feature_repo
+feast apply
+# → Feast đọc feature_store.yaml trong thư mục hiện tại
+# → Quét tất cả file .py trong thư mục (đệ quy)
+# → Parse các đối tượng Feast (FeatureView, Entity...)
+# → Đồng bộ registry với định nghĩa tìm được
+```
+
+**Cụ thể khi gõ `feast apply`:**
+
+```
+feast apply
+    │
+    ├── 1. Tìm feature_store.yaml trong thư mục hiện tại
+    │
+    ├── 2. Quét toàn bộ file *.py (đệ quy)
+    │      ├── feature_view.py → parse FeatureView
+    │      ├── entity.py → parse Entity
+    │      └── ...
+    │
+    ├── 3. So sánh với registry hiện tại
+    │      ├── FeatureView mới → tạo
+    │      ├── FeatureView thay đổi → cập nhật
+    │      └── FeatureView bị xoá → xoá
+    │
+    └── 4. Deploy infrastructure
+           └── Tạo collection trong Milvus, table trong Redis...
+```
+
+> ⚠️ **Vì Feast quét tất cả file `.py`**, bạn **không được để code app chung với file Feast**.
+> Nếu `feature_store.yaml` và `feature_view.py` nằm cùng thư mục với code FastAPI,
+> Feast sẽ cố import cả code app → lỗi `ModuleNotFoundError`.
+>
+> **Giải pháp:** Tách riêng `feature_repo/` chỉ chứa file Feast.
+> ```tree
+> feature_repo/
+> ├── feature_store.yaml     ← Feast
+> └── feature_view.py        ← Feast
+> src/
+> ├── services/              ← code app
+> ├── routers/               ← code app
+> └── ...
+> ```
+>
+> Cách gọi từ code Python:
+> ```python
+> # Đường dẫn tương đối hoặc tuyệt đối đến thư mục chứa feature_store.yaml
+> store = FeatureStore("feature_repo")
+> ```
+
+### 7.3 ⚠️ Lưu ý quan trọng — `provider: local` + Milvus = Milvus Lite
+
+> Nguồn: [Feast docs — Milvus online store](https://docs.feast.dev/reference/online-stores/milvus.md) | [Feast source code — milvus.py](https://github.com/feast-dev/feast/blob/master/sdk/python/feast/infra/online_stores/milvus_online_store/milvus.py)
+
+Tài liệu Feast **không đề cập rõ ràng** về hạn chế này, nhưng code Feast v0.49.0 có logic cứng:
+
+```python
+def _connect(self, config):
+    if config.provider == "local":
+        # BẮT BUỘC dùng Milvus Lite (file local)
+        self.client = MilvusClient(db_path)      # ← path từ config
+    else:
+        # Dùng remote Milvus (host:port)
+        self.client = MilvusClient(url=...)       # ← host:port từ config
+```
+
+Khi `provider: local`:
+- Feast **luôn** gọi `MilvusClient(db_path)` — dùng Milvus Lite (file SQLite local)
+- `host`/`port` trong config **bị bỏ qua hoàn toàn**
+- Dù bạn có ghi `host: localhost, port: 19530` cũng vô dụng
+
+Khi `provider: gcp` (hoặc `aws`):
+- Feast gọi `MilvusClient(url=...)` — kết nối đến Docker Milvus thật
+- `host`/`port` được dùng để tạo URL kết nối
+
+**Giải pháp:** dùng `provider: gcp` và override `online_store → type: milvus` + `offline_store → type: file`:
+
+```yaml
+provider: gcp                 # ← bắt buộc để dùng remote Milvus
+offline_store:
+  type: file                  # override: không dùng BigQuery mặc định của gcp
+online_store:
+  type: milvus                # override: không dùng Datastore mặc định của gcp
+  host: localhost
+  port: 19530
+```
+
+> **Tài liệu chính thức không nói gì về hạn chế này.** Nó chỉ được phát hiện khi đọc source code.
+> Có thể Feast sẽ sửa trong tương lai, nhưng hiện tại (v0.49.0) đây là behavior thật.
+
+### 7.4 Cấu hình ví dụ (Milvus)
 
 ```yaml
 project: local_rag

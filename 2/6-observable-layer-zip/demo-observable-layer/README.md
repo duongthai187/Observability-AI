@@ -16,13 +16,33 @@ uv sync --active
 You need to initialize a OpenAI API Key and fill it to a file named `.env` with same format to file `sample.env`
 
 ## To run demo
-### Step 1: Build the infra for Langfuse
+
+### Step 1: Build the infra for Langfuse + Milvus + PostgreSQL
 
 ```bash
 cd infra && docker compose up -d
 ```
 
-### Step 2: Create a prompt on Langfuse
+> PostgreSQL init script tự động tạo database `feast` và user `airflow` khi container khởi tạo lần đầu.
+> File: `infra/init-feast-db.sql`
+
+### Step 2: Setup Feast (feature view + index data)
+
+```bash
+# 2a. Register feature view definitions
+cd feature_repo && ../.venv/bin/feast apply
+
+# 2b. Index 5332 passages into Milvus
+cd .. && uv run scripts/index_to_feast.py
+```
+
+Hoặc chạy 1 script duy nhất:
+
+```bash
+uv run scripts/setup_feast.sh
+```
+
+### Step 3: Create a prompt on Langfuse
 
 #### Step 2.1: You need to create a new account on Langfuse
 #### Step 2.2: You login again with the created account

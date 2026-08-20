@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     # OpenAI API key
     OPENAI_API_KEY: SecretStr
     OPENAI_TEMPERATURE: float = 0.7
+    # Custom endpoint for OpenAI-compatible API (e.g. AI Box, proxy, Ollama, vLLM, LiteLLM)
+    # Leave empty to use the default https://api.openai.com/v1
+    OPENAI_BASE_URL: str = "https://api.ai-box.vn/v1"
+    # Model names (change via .env)
+    OPENAI_CHAT_MODEL: str = "qwen3.7-flash"
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-v4"
     
     # Milvus configuration
     MILVUS_HOST: str = "localhost"

@@ -7,7 +7,7 @@ import json
 class RetrievalService:
     def __init__(self):
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        self.store = FeatureStore("src")
+        self.store = FeatureStore("feature_repo")
 
     def retrieve_vector(self, question: str):
         """Retrieve documents based on the question using vector search."""

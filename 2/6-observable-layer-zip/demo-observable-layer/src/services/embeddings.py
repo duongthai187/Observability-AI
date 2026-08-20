@@ -1,13 +1,13 @@
 from src.settings import SETTINGS
 from langchain_openai import OpenAIEmbeddings
-from src.constants.enum import LLMModel
 
 
 class EmbeddingService:
     def __init__(self):
         self.embedding_model = OpenAIEmbeddings(
-            model=LLMModel.OPENAI_TEXT_EMBEDDING_3_LARGE.value, 
-            api_key=SETTINGS.OPENAI_API_KEY
+            model=SETTINGS.OPENAI_EMBEDDING_MODEL,
+            api_key=SETTINGS.OPENAI_API_KEY,
+            base_url=SETTINGS.OPENAI_BASE_URL or None,
         )
 
     def embed_text(self, text: str):

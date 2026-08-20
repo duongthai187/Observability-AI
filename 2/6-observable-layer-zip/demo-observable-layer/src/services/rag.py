@@ -3,17 +3,18 @@ from langchain.chat_models import init_chat_model
 from src.settings import SETTINGS
 from src.services.generator import GeneratorService
 from src.services.retrieval import RetrievalService
-from src.constants.enum import LLMModel, LLMProvider
+from src.constants.enum import LLMProvider
 from typing import Optional
 
 
 class Rag:
     def __init__(self):
         self.llm_chat = init_chat_model(
-            LLMModel.OPENAI_GPT_4O_MINI.value,
+            SETTINGS.OPENAI_CHAT_MODEL,
             api_key=SETTINGS.OPENAI_API_KEY,
             temperature=SETTINGS.OPENAI_TEMPERATURE,
             model_provider=LLMProvider.OPENAI.value,
+            base_url=SETTINGS.OPENAI_BASE_URL or None,
         )
         
         self.retrieval_service = RetrievalService()

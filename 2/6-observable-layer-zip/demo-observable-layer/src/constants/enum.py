@@ -5,8 +5,8 @@ class LLMModel(Enum):
     """
     Enum for LLM models.
     """
-    OPENAI_TEXT_EMBEDDING_3_LARGE = "text-embedding-3-large"
-    OPENAI_GPT_4O_MINI = "gpt-4o-mini"
+    OPENAI_TEXT_EMBEDDING_V4 = "text-embedding-v4"
+    QWEN_3_7_FLASH = "qwen3.7-flash"
     
 
 class LLMProvider(Enum):

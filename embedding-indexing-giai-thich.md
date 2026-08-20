@@ -412,23 +412,191 @@ Bắt đầu từ entry point (layer 2):
 
 #### Bước 3: "Kết bạn" — Nối cạnh
 
-```
-Kết quả: [X] gần nhất với [F], [G], [H], [K], [M]...
+> ⚠️ **Cập nhật theo HNSW paper (Malkov & Yashunin 2018, arXiv:1603.09320):**
+> Việc chọn cạnh không đơn giản là "lấy M node gần nhất" hay "xoá cạnh xa nhất".
+> Nó dùng một **heuristic đặc biệt (SELECT-NEIGHBORS-HEURISTIC)** để đảm bảo
+> **tính đa dạng (diversity)** của graph — tránh "kết bạn" với quá nhiều node
+> trong cùng một cụm.
 
-  Layer 1:  [F] ── [X] ── [G]   (nối với tối đa M cạnh)
+##### 3.4.1 `ef_construction` — Hàng đợi 100 ứng viên
+
+```
+Khi tìm kiếm bạn cho [X], HNSW duy trì một priority queue (hàng đợi ưu tiên):
+
+  Priority queue (sức chứa ef_construction = 100):
+  ┌─────────────────────────────────────────────────────────────┐
+  │  [F]  (0.27)  ← gần X nhất → lấy ra, xem hàng xóm của [F]  │
+  │  [G]  (0.29)                                                │
+  │  [E]  (0.31)                                                │
+  │  [H]  (0.33)                                                │
+  │  ...                                                        │
+  │  [Z]  (0.89)  ← node xa nhất trong queue (còn chỗ)          │
+  └─────────────────────────────────────────────────────────────┘
                       │
-                      [H]        (các cạnh này là "đường đi nhanh")
+                      ▼
+  Hàng xóm của [F] là [G], [E], [D], [C], [X]
+  → [G] đã có trong queue, [X] là chính nó
+  → [D] (0.35) và [C] (0.38) được thêm vào queue
+  → [Z] (0.89) bị đẩy ra khỏi queue (vì queue chỉ chứa 100 node)
 
-  Layer 0:  [E] ── [F] ── [X] ── [G] ── [H]
-                      │      │
-                      [K] ───┘
-                      [M] ───┘
-
-  Các node cũ [F], [G], [H] cũng được cập nhật:
-  trước: [F]─[G]─[H]─[E]─[D]     (5 cạnh)
-  sau:   [F]─[G]─[H]─[E]─[D]─[X] (6 cạnh, thêm [X])
-  Nếu quá M cạnh → xóa cạnh xa nhất
+  Quá trình lặp lại: lấy [G] ra → xem hàng xóm của G → thêm vào queue...
+  Đến khi node gần nhất trong queue không thay đổi → dừng.
+  → 100 node còn lại trong queue là ỨNG VIÊN để kết bạn.
 ```
+
+> **`ef_construction = 100`** = "số ứng viên tối đa được xem xét trước khi chọn bạn".
+> Càng lớn → càng tốn thời gian build, nhưng tìm được bạn chính xác hơn.
+> Nguồn: Qdrant docs — *"Number of neighbours to consider during the index building."*
+
+##### 3.4.2 SELECT-NEIGHBORS-HEURISTIC — Chọn 16 bạn từ 100 ứng viên
+
+> **Điều kiện chọn (QUAN TRỌNG):** — từ HNSW paper Algorithm 3 line 11:
+> ```
+> if e is closer to q compared to any element from R
+> ```
+> Nghĩa là: **`distance(e, X) < distance(e, f)`** với **mọi** f ∈ R.
+> So sánh khoảng cách từ e tới X với khoảng cách từ e tới từng f đã chọn.
+> KHÔNG phải so sánh `distance(e, X)` với `distance(f, X)`.
+
+Từ 100 ứng viên, HNSW xét từng node theo thứ tự khoảng cách tới X tăng dần.
+Mỗi node được chọn chỉ nếu nó **gần X hơn là gần mọi node đã chọn trước đó**:
+
+```
+Giả sử không gian 2D, X ở gần CỤM 1 (ML), xa CỤM 2 (Rainforest):
+
+             CỤM 1 (ML)          Khoảng cách tới X:
+  [F] ── [G]                      F=0.27, G=0.29, E=0.31, H=0.33, K=0.35
+  │      │                        Rainforest=0.60, Amazon=0.62
+  [E] ── [H] ── [K]
+    \   /                          CỤM 2 (Rainforest):
+     \ /                            [Rainforest] ── [Amazon]
+      X
+
+  Khoảng cách GIỮA các node (cùng cụm gần nhau, khác cụm xa nhau):
+  d(F,G)=0.10, d(F,E)=0.12, d(F,H)=0.15, d(F,K)=0.18, d(G,E)=0.08, ...
+  d(F,Rainforest)=0.85, d(Rainforest,Amazon)=0.08
+```
+
+**Quá trình chọn (đúng theo paper):**
+
+```
+Bước 1: Xét [F] — R = ∅ (chưa có ai)                    → ✅ chọn      → R = {[F]}
+
+Bước 2: Xét [G] — d(G,X)=0.29, d(G,F)=0.10
+                  → 0.29 > 0.10 → G gần F hơn gần X      → ❌ loại      → (cùng cụm với F)
+
+Bước 3: Xét [E] — d(E,X)=0.31, d(E,F)=0.12
+                  → 0.31 > 0.12 → E gần F hơn gần X      → ❌ loại      → (cùng cụm với F)
+
+Bước 4: Xét [H] — d(H,X)=0.33, d(H,F)=0.15
+                  → 0.33 > 0.15 → H gần F hơn gần X      → ❌ loại      → (cùng cụm với F)
+
+Bước 5: Xét [K] — d(K,X)=0.35, d(K,F)=0.18
+                  → 0.35 > 0.18 → K gần F hơn gần X      → ❌ loại      → (cùng cụm với F)
+
+Bước 6: Xét [Rainforest] — d(Rf,X)=0.60, d(Rf,F)=0.85
+                           → 0.60 < 0.85 → Rf gần X hơn gần F
+                           → ✅ chọn                       → R = {[F], [Rainforest]}
+
+Bước 7: Xét [Amazon] — d(Am,X)=0.62, d(Am,F)=0.87, d(Am,Rf)=0.08
+                       → 0.62 < 0.87 ✓ (xa F)
+                       → nhưng 0.62 > 0.08 ✗ (gần Rainforest hơn gần X)
+                       → ❌ loại                           → (cùng cụm với Rainforest)
+```
+
+**Kết quả:** R = {[F], [Rainforest]} — chỉ 2 node được chọn!
+- **[F]** — đại diện cho CỤM 1 (ML)
+- **[Rainforest]** — đại diện cho CỤM 2 (Rainforest)
+
+> **Tất cả các node còn lại trong CỤM 1 (G, E, H, K...) đều bị loại** vì chúng gần F hơn gần X.
+> Đây chính là ý nghĩa của **"cùng một cụm"**: nếu một node đã kết bạn với F rồi, thì không cần
+> kết bạn thêm với G, E, H... vì chúng đều ở cùng một chỗ — lãng phí "suất kết bạn".
+>
+> Heuristic này buộc X phải tìm bạn ở **các cụm khác nhau**, tạo graph có đường đi đến nhiều vùng.
+> Nguồn: HNSW paper Algorithm 4 — SELECT-NEIGHBORS-HEURISTIC, Section 4.1.
+
+##### 3.4.3 "Cùng một cụm" là sao?
+
+Trong không gian vector 384 chiều, các passage có chủ đề tương tự nhau sẽ nằm **gần nhau**,
+tạo thành một **cụm (cluster)**:
+
+```
+Trong không gian 384 chiều (hình ảnh minh hoạ 2D):
+
+              ┌─────────────────────────────────────┐
+              │  CỤM 1: "Machine Learning"          │
+              │    [ML] ── [Deep Learning] ── [NN]  │  ← các vector rất gần nhau
+              │    [Supervised] ── [Unsupervised]   │
+              │        │                            │
+              │        │ xa nhau                    │  ← khoảng cách lớn
+              │        │                            │
+              │  CỤM 2: "Amazon Rainforest"         │
+              │    [Rainforest] ── [Amazon] ── [River]│
+              │    [Moist] ── [Broadleaf]           │
+              └─────────────────────────────────────┘
+
+  [ML] cách [Deep Learning] = 0.25  (cùng cụm)
+  [ML] cách [Rainforest]     = 0.85  (khác cụm)
+```
+
+**Vấn đề:** Nếu HNSW chỉ chọn `M=16` node gần nhất, [X] sẽ kết bạn với **16 node trong cùng CỤM 1** — graph chỉ toàn "bạn trong xóm", không có đường đi sang CỤM 2.
+
+```
+Kết bạn với 16 node gần nhất (CHỈ trong CỤM 1):
+  [X] ── [ML] ── [Deep Learning] ── [NN] ── [Supervised] ── ...
+  │
+  └── Không có đường sang CỤM 2!
+      → Khi search "Amazon", HNSW phải đi rất xa mới tới được
+```
+
+**Heuristic giải quyết thế nào?** Nó **không** chọn 16 node gần nhất theo khoảng cách tới X.
+Mỗi node chỉ được chọn nếu nó **gần X hơn là gần mọi node đã chọn** — tự động ưu tiên node khác cụm:
+
+```
+  Ứng viên (sắp xếp theo khoảng cách tới X):
+  [ML]=0.25, [DL]=0.27, [NN]=0.28, [Rainforest]=0.60, [Amazon]=0.62, [River]=0.64...
+
+  Biết thêm:
+  d(ML,DL)=0.08, d(ML,NN)=0.10, d(ML,Rainforest)=0.85, d(Rainforest,Amazon)=0.08, ...
+
+  Nếu chọn 16 gần nhất: [ML], [DL], [NN]... (toàn bộ CỤM 1)
+  Nếu dùng heuristic:
+    [ML] (0.25) → R=∅ → ✅ chọn                              → R = {[ML]}
+    [DL] (0.27) → d(DL,X)=0.27 > d(DL,ML)=0.08 → ❌ loại     → (cùng cụm ML)
+    [NN] (0.28) → d(NN,X)=0.28 > d(NN,ML)=0.10 → ❌ loại     → (cùng cụm ML)
+    ...
+    [Rainforest] (0.60) → d(Rf,X)=0.60 < d(Rf,ML)=0.85 → ✅ chọn → R = {[ML], [Rainforest]}
+    [Amazon] (0.62) → d(Am,X)=0.62 < d(Am,ML)=0.87 ✓
+                      d(Am,X)=0.62 > d(Am,Rf)=0.08 ✗ → ❌ loại → (cùng cụm Rainforest)
+    [River] (0.64) → d(Rv,X)=0.64 < d(Rv,ML)=0.86 ✓, d(Rv,X)=0.64 < d(Rv,Rf)=0.10?
+                     0.64 > 0.10 → ❌ loại                    → (cùng cụm Rainforest)
+```
+
+**Kết quả:** [X] có cả bạn trong CỤM 1 (ML, DL, NN...) lẫn bạn trong CỤM 2 (Rainforest).
+Khi search "Amazon", từ [X] chỉ cần 1 bước là sang CỤM 2.
+
+> **"Cùng một cụm" = các node quá gần nhau, thuộc cùng một vùng ngữ nghĩa**
+> (ví dụ: tất cả passage về ML). Kết bạn với nhiều node cùng cụm là lãng phí
+> "suất kết bạn" — graph không có "đường đi xa", search chậm hơn.
+>
+> Heuristic này được HNSW paper gọi là **"significantly increases performance
+> at high recall and in case of highly clustered data."** (trích Section 4).
+
+##### 3.4.4 Node cũ bị ảnh hưởng thế nào?
+
+Khi node mới X kết bạn với node cũ F, F có thêm 1 cạnh `F─X`. Nếu F **đã có M=16 cạnh**:
+
+```
+  Trước: [F]─[G]─[H]─[E]─[D]─[C]─[B]─[A]─[K]─[L]─[M]─[N]─[O]─[P]─[Q]─[R]   (16 cạnh)
+  Thêm:  [F]─[X]                                                              (+1 cạnh → 17 cạnh)
+  
+  → F chạy lại heuristic: gom 17 cạnh → chọn ra 16 cạnh tốt nhất
+  → Cạnh xa nhất hoặc "cùng cụm" nhất bị loại
+  → Có thể loại [R] (xa nhất, 0.85) hoặc [Q] (gần [P] quá, cùng cụm)
+```
+
+> **Không đơn giản là "xoá cạnh xa nhất"** — F chạy lại heuristic y hệt như X,
+> ưu tiên giữ lại các cạnh đa dạng, loại bỏ cạnh "cùng cụm" trước khi loại cạnh xa.
 
 ### 3.5 Cách tìm kiếm (Search) — Ví dụ đi từ A đến Z
 
@@ -650,7 +818,92 @@ Tốc độ search:
 
 ---
 
-## 4. `SentenceTransformer("all-MiniLM-L6-v2")` là gì?
+## 3.11 Kiến trúc Milvus — Vector Database cho project 2
+
+Project 2 (`6-observable-layer-zip`) dùng **Milvus** thay vì Qdrant, thông qua **Feast** làm lớp trung gian.
+
+### 3.11.1 Kiến trúc Milvus đầy đủ (production)
+
+Milvus gồm **3 thành phần riêng biệt**:
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Milvus     │────▶│    etcd      │     │    MinIO     │
+│ (query node) │     │(metadata)    │     │  (storage)   │
+│ (index node) │     │ track:       │     │  lưu:        │
+│ (data node)  │     │ - node list  │     │  - vector    │
+│ (proxy)      │     │ - config     │     │  - log       │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+| Thành phần | Vai trò | Giao thức |
+|---|---|---|
+| **Milvus** | Xử lý vector search (index, query) | gRPC :19530 |
+| **etcd** | Lưu metadata (node nào có dữ liệu gì, config cluster) | gRPC :2379 |
+| **MinIO** | Lưu dữ liệu thật (vector file, index file, log) | S3 :9000 |
+
+> Nguồn: [Milvus docs — Storage Overview](https://milvus.io/docs/v2.6.x/build_rag_on_arm.md)
+
+### 3.11.2 Embedded etcd — Chạy nhẹ cho máy cá nhân
+
+Chạy đủ 3 container (Milvus + etcd + MinIO) rất nặng, nhất là trên máy cá nhân. Milvus hỗ trợ **embedded etcd** — etcd chạy **ngay trong tiến trình Milvus**, không cần container riêng:
+
+```
+Với ETCD_USE_EMBED=true:
+┌──────────────────────────────┐
+│         Milvus               │
+│  ┌──────────────────────┐    │
+│  │  etcd (embedded)     │    │
+│  │  chạy bên trong      │    │
+│  │  tiến trình Milvus   │    │
+│  └──────────────────────┘    │
+│  ┌──────────────────────┐    │
+│  │  MinIO (embedded)    │    │
+│  │  hoặc local disk     │    │
+│  └──────────────────────┘    │
+└──────────────────────────────┘
+```
+
+Cấu hình trong docker-compose:
+
+```yaml
+milvus:
+  image: milvusdb/milvus:v2.4.14
+  command: ["milvus", "run", "standalone"]
+  environment:
+    ETCD_USE_EMBED: "true"       # ← dùng etcd embedded
+    ETCD_DATA_DIR: "/var/lib/milvus/etcd"
+    COMMON_STORAGE_TYPE: "local" # ← dùng local disk, không cần MinIO
+```
+
+> Nguồn: [Milvus docs — etcd.use.embed](https://milvus.io/docs/v2.6.x/configure_etcd.md): *"Milvus can be configured to use an embedded etcd server, which runs as an in-process server."*
+
+### 3.11.3 Milvus Lite — Còn nhẹ hơn nữa (không cần Docker)
+
+**Milvus Lite** là phiên bản chạy hoàn toàn trong Python (dùng `milvus-lite` package), không cần Docker, dùng SQLite để lưu vector local:
+
+```python
+# Không cần Docker, không cần etcd, không cần MinIO
+# pip install milvus-lite
+from milvus import MilvusClient
+client = MilvusClient("data/milvus.db")  # local file
+```
+
+Feast sử dụng Milvus Lite khi không tìm thấy Docker Milvus (host:port) — nó tự động chuyển sang local mode với file `online_store.db`:
+
+```
+Connecting to Milvus in local mode using feature_repo/online_store.db
+```
+
+> ⚠️ **Lưu ý Feast:** Khi `provider: local` trong `feature_store.yaml`, Feast **bắt buộc** dùng Milvus Lite
+> bất kể `host`/`port` có ghi gì. Đây là hạn chế trong code Feast v0.49.0 (xem `feast-chi-tiet.md` §7.3).
+> Để dùng Docker Milvus thật, phải đổi `provider: gcp` + override online_store.
+
+Đây là chế độ project 2 đang dùng hiện tại — vì `host: milvus-standalone` không tới được (Docker Milvus không được dùng, Milvus Lite tự động fallback).
+
+> Nguồn: [Feast docs — Milvus online store](https://docs.feast.dev/reference/online-stores/milvus.md)
+
+---
 
 ### 4.1 Tổng quan
 

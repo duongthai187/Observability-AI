@@ -138,6 +138,15 @@ docker compose up -d
 docker compose ps   # chờ các service healthy
 ```
 
+> **Cấu hình ingestion real-time:** Mặc định Langfuse gửi trace từ app → UI sau ~5-10s.
+> Trong `docker-compose.yaml` đã set `LANGFUSE_INGESTION_QUEUE_DELAY_MS=0`
+> và `LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS=1000` (1s) để trace
+> xuất hiện gần như real-time.
+>
+> SDK side: `flush_interval` mặc định 5s, `flush_at` mặc định 30 events.
+> Có thể override bằng biến môi trường `LANGFUSE_FLUSH_INTERVAL=1` trong `.env`.
+> Xem thêm: [Langfuse docs — Queuing/Batching](https://langfuse.com/docs/observability/features/queuing-batching)
+
 | Service | Port ngoài | Mục đích |
 |---|---|---|
 | `langfuse-web` | `3000` | UI Langfuse |
